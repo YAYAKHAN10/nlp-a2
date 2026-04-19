@@ -1,0 +1,691 @@
+# ── Extract sentences from docs ──
+def extract_sentences(docs, doc_topics, min_len=3, max_len=50):
+    sents = []   # (tokens_list, topic)
+    print(f"DEBUG: Number of documents received by extract_sentences: {len(docs)}")
+    if not docs:
+        print("DEBUG: Docs list is empty, returning empty sentences list.")
+        return []
+
+    for doc_idx, (doc, topic) in enumerate(zip(docs, doc_topics)):
+        all_doc_tokens = doc.split()
+
+        # Debugging output for the first few documents
+        if doc_idx < 5:
+            print(f"DEBUG: Doc {doc_idx} (topic: {topic}) - Raw char length: {len(doc)}, Token count after split(): {len(all_doc_tokens)}")
+            if not all_doc_tokens:
+                print(f"DEBUG: Doc {doc_idx} resulted in 0 tokens after split(). Content sample: '{doc[:100]}'")
+            elif len(all_doc_tokens) < min_len:
+                print(f"DEBUG: Doc {doc_idx} token count ({len(all_doc_tokens)}) is less than min_len ({min_len}). Content sample: '{' '.join(all_doc_tokens[:min_len+2])}'")
+
+        if not all_doc_tokens:
+            continue # Skip documents that yield no tokens
+
+        # Split into chunks of max_len
+        for i in range(0, len(all_doc_tokens), max_len):
+            chunk = all_doc_tokens[i : i + max_len]
+            if len(chunk) >= min_len: # Ensure chunk is at least min_len
+                sents.append((chunk, topic))
+            # else:
+            #     if doc_idx < 5 and len(chunk) > 0: # Only print if chunk is not empty and too short
+            #         print(f"DEBUG: Doc {doc_idx} chunk length ({len(chunk)}) is less than min_len ({min_len}). Chunk content: '{' '.join(chunk)}'")
+
+    print(f"DEBUG: Total sents collected before final sampling: {len(sents)}")
+    return sents
+
+all_sents = extract_sentences(docs_clean, doc_topics)
+print(f"Total available sentences: {len(all_sents)}")
+
+# Stratified sampling: 500 sentences, ≥100 per topic
+random.seed(42)
+by_topic = defaultdict(list)
+for s in all_sents:
+    by_topic[s[1]].append(s)
+
+sampled = []
+for topic in TOPIC_KW:
+    pool = by_topic[topic]
+    random.shuffle(pool)
+    sampled.extend(pool[:max(100, 500 // len(TOPIC_KW))])
+
+# Top up to 500
+remaining = [s for s in all_sents if s not in sampled]
+random.shuffle(remaining)
+sampled = sampled[:500] if len(sampled) >= 500 else sampled + remaining[:500-len(sampled)]
+random.shuffle(sampled)
+sampled = sampled[:500]
+
+sent_tokens = [s[0] for s in sampled]
+sent_topics = [s[1] for s in sampled]
+print(f"Sampled: {len(sampled)} sentences")
+print("Topic distribution:", dict(Counter(sent_topics)))
+
+
+
+
+
+# ──────────────────────────────────────────────────────────────────
+# POS RULE-BASED TAGGER (12-tag set)
+# Built on morphological patterns + hand-crafted lexicon (200+ entries)
+# Tags: NOUN VERB ADJ ADV PRON DET CONJ POST NUM PUNC UNK
+# ──────────────────────────────────────────────────────────────────
+
+NOUNS = {
+    'حکومت','وزیر','پارلیمنٹ','ملک','شہر','عوام','صدر','وزیراعظم',
+    'عدالت','فوج','پولیس','ادار','بینک','اسکول','ہسپتال','یونیورسٹ',
+    'میچ','ٹیم','کھلاڑ','کپ','رنز','وکٹ','بلے','کرکٹ','فٹ بال',
+    'بجٹ','روپ','ڈالر','تجارت','درآمد','برآمد','افراط','مہنگائ',
+    'معاہدہ','تنازع','جنگ','امن','سفارت','سرحد','صوبہ','ضلع',
+    'بیمار','ویکسین','سیلاب','خشک سال','تعلیم','نصاب','امتحان',
+    'خبر','رپورٹ','تصویر','ویڈیو','مضمون','اخبار','چینل','نشریات',
+    'گھر','شادی','خاندان','بچ','والدین','قانون','حق','آزادی',
+    'پاکستان','انڈیا','چین','امریکہ','روس','ایران','افغانستان',
+    'کراچی','لاہور','اسلام آباد','پشاور','کوئٹہ','دہلی','کابل',
+    'ادار','تنظیم','جماعت','پارٹ','اتحاد','لیگ','کمیٹ',
+    'سال','ماہ','ہفتہ','روز','وقت','دن','رات','صبح','شام',
+    'نتیج','فیصلہ','حکم','اعلان','بیان','تقریر','اجلاس','کانفرنس',
+    'پیس','فیصد','کروڑ','ارب','لاکھ','ہزار',
+}
+VERBS = {
+    'ہے','ہیں','تھا','تھی','تھے','ہوا','ہوئ','ہوئے','گیا','گئ','گئے',
+    'کیا','کی','کیے','کرت','کررہ','کررہی','کررہے','کرن','کریں','کرو',
+    'ہوگ','ہوگی','ہوگے','کرے','کرے گ','کریں گے','دیا','دی','دیے',
+    'آیا','آئ','آئے','جائ','جائے','جائیں','آئیں','ملا','ملی','ملے',
+    'بتای','بتایا','بتائ','کہا','کہی','کہے','لکھا','لکھی','لکھے',
+    'چاہیے','سکت','سکتی','سکتے','سکا','سکی','سکے','پائ','پایا',
+    'رہا','رہی','رہے','رہن','ہون','کہن','کرن','دیکھن','سنن',
+    'بنا','بنی','بنے','بنائ','بنایا','دکھائ','دکھایا',
+    'لے','لی','لیا','لیے','لیں','لین','نکلا','نکلی','نکلے',
+    'مار','مارا','ماری','مارے','پہنچا','پہنچی','پہنچے',
+    'شامل','خارج','حاصل','قائم','برخاست',
+}
+ADJS = {
+    'بڑ','چھوٹ','اچھ','برا','نئ','پران','مشہور','اہم','ضرور','ممکن',
+    'مشکل','آسان','مضبوط','کمزور','تیز','سست','خوب','بہتر','بدتر',
+    'پہل','آخر','بیچ','اندر','باہر','اگل','پچھل','اونچ','نیچ',
+    'سرکار','نجی','قومی','بین الاقوام','مقام','غیر ملک','خارج',
+    'کامیاب','ناکام','معروف','مقبول','خاص','عام','فور','فوری',
+    'مکمل','ناقص','درست','غلط','سچ','جھوٹ','صحیح','خراب',
+    'ابتدائ','حتمی','اہم','معمول','غیرمعمول','بنیاد','اصل',
+}
+ADVS = {
+    'بہت','کافی','تھوڑ','زیادہ','کم','اکثر','کبھ','ہمیش','کبھی کبھی',
+    'ابھی','ابتداً','پھر','بھی','تو','ہی','صرف','بس','یقیناً',
+    'واضح','خاص طور','عام طور','اچانک','فور','جلد','دھیر','آہستہ',
+    'مزید','اور','بھی','کیونکہ','لہذا','چنانچہ','البتہ','تاہم',
+}
+PRONS = {
+    'وہ','یہ','ہم','آپ','تم','میں','وہاں','یہاں','کون','کیا','جو',
+    'اس','ان','انھ','انہوں','انھوں','اسے','انہیں','جسے','جنہیں',
+    'ہمارا','آپ کا','تمہارا','میرا','اس کا','ان کا','جس کا',
+    'خود','اپنا','اپنی','اپنے','خود کو','جو کچھ','جتنا',
+}
+DETS = {
+    'ایک','دو','تین','ہر','کوئ','کچھ','بعض','تمام','سب','پور',
+    'کئ','ذیادہ','کم','چند','متعدد','مختلف','یہ','وہ','اس','ان',
+}
+CONJS = {
+    'اور','یا','لیکن','مگر','کیونکہ','تاکہ','جب','جہاں','اگر',
+    'تو','تاہم','البتہ','بلکہ','چنانچہ','لہذا','جبکہ','حالانکہ',
+    'نیز','بھی','اسی لیے','اس لیے','جس طرح','اس طرح','گوکہ',
+}
+POSTP = {
+    'کا','کی','کے','نے','کو','میں','پر','سے','تک','لیے','ساتھ',
+    'بعد','پہلے','دوران','خلاف','حق','بار','حوال','مطابق','نزدیک',
+    'جانب','طرف','ذریع','بنا','بغیر','علاوہ','سوا','آگ','پیچھ',
+}
+NUMS  = {'<NUM>','ایک','دو','تین','چار','پانچ','چھ','سات','آٹھ','نو','دس',
+         'گیارہ','بارہ','سو','ہزار','لاکھ','کروڑ','ارب','پہل','دوسر','تیسر'}
+PUNCS = set('،؟!.:;()[]{}""''۔؛')
+
+LEXICON = {}
+for w in NOUNS:  LEXICON[w]='NOUN'
+for w in VERBS:  LEXICON[w]='VERB'
+for w in ADJS:   LEXICON[w]='ADJ'
+for w in ADVS:   LEXICON[w]='ADV'
+for w in PRONS:  LEXICON[w]='PRON'
+for w in DETS:   LEXICON[w]='DET'
+for w in CONJS:  LEXICON[w]='CONJ'
+for w in POSTP:  LEXICON[w]='POST'
+for w in NUMS:   LEXICON[w]='NUM'
+for w in PUNCS:  LEXICON[w]='PUNC'
+
+# Morphological suffix rules (Urdu)
+VERB_SUFFIXES  = ('ئ','گ','یں','یا','ئے','تا','تی','تے','نا','نی','نے','کر','اً','ہو')
+NOUN_SUFFIXES  = ('ت','ار','وں','یوں','اں','یاں','گاہ','دان','ستان','خانہ')
+ADJ_SUFFIXES   = ('ول','ند','ین','انہ','آور','مند','پرست')
+
+def rule_pos(tok, prev=None, next_tok=None):
+    if tok in LEXICON:
+        return LEXICON[tok]
+    if tok == '<NUM>' or tok.isdigit():
+        return 'NUM'
+    if all(c in '،؟!.:;()[]۔؛' for c in tok):
+        return 'PUNC'
+    if tok.endswith(VERB_SUFFIXES):
+        return 'VERB'
+    if tok.endswith(NOUN_SUFFIXES):
+        return 'NOUN'
+    if tok.endswith(ADJ_SUFFIXES):
+        return 'ADJ'
+    if prev in POSTP or tok in ('سے','کو','پر','میں'):
+        return 'NOUN'
+    return 'UNK'
+
+def pos_tag(tokens):
+    tags = []
+    for i, tok in enumerate(tokens):
+        prev = tokens[i-1] if i > 0 else None
+        nxt  = tokens[i+1] if i < len(tokens)-1 else None
+        tags.append(rule_pos(tok, prev, nxt))
+    return tags
+
+# Sample annotation
+sample = sent_tokens[0]
+print("Sample POS annotation:")
+print("Tokens:", sample[:10])
+print("Tags:  ", pos_tag(sample)[:10])
+
+
+
+
+# ──────────────────────────────────────────────────────────────────
+# NER TAGGER — BIO scheme
+# Gazetteer: 50+ Pakistani persons, 50+ locations, 30+ organisations
+# Tags: B-PER I-PER B-LOC I-LOC B-ORG I-ORG B-MISC I-MISC O
+# ──────────────────────────────────────────────────────────────────
+
+GAZETTEER_PER = {
+    'عمران','خان','شہباز','شریف','نواز','بھٹو','زرداری','مریم','بلاول',
+    'چوہدری','قریشی','فواد','شیخ','راشد','احمد','علی','محمد','حسن',
+    'حسین','فاروق','اعظم','طارق','جاوید','ظفر','امجد','سعد','رانا',
+    'نیازی','اسد','انور','غلام','ایاز','صادق','مشاہد','سید','کیانی',
+    'پاشا','باجوہ','منیر','فیض','عاصم','قمر','جاوید','عارف','علوی',
+    'مودی','مکھرجی','راہل','گاندھی','کمار','راجیش','پوتین','بائیڈن',
+    'جمال','خاشقجی','سلمان','محمد','ابراہیم','رئیسی',
+}
+GAZETTEER_LOC = {
+    'پاکستان','انڈیا','چین','امریکہ','روس','ایران','افغانستان','ترکی',
+    'کراچی','لاہور','اسلام','آباد','پشاور','کوئٹہ','ملتان','فیصل آباد',
+    'راولپنڈی','حیدرآباد','سکھر','کوئٹہ','گوادر','مظفرآباد','گلگت',
+    'دہلی','ممبئی','کولکتہ','چنئی','بنگلور','حیدرآباد',
+    'کابل','تہران','بیجنگ','ماسکو','واشنگٹن','لندن','پیرس','برلن',
+    'خیبر','پختونخوا','پنجاب','سندھ','بلوچستان','آزاد','کشمیر','گلگت',
+    'بنگلہ','دیش','سریلنکا','نیپال','میانمار','انڈونیشیا','ملیشیا',
+    'اقوام','متحدہ','جنیوا','نیویارک','لاس','اینجلس',
+    'بنوں','سوات','وزیرستان','باجوڑ','مہمند','اورکزئ','کرم',
+    'میرپور','ایبٹ آباد','نوشہرہ','مردان','صوابی','چارسدہ',
+}
+GAZETTEER_ORG = {
+    'حکومت','پارلیمنٹ','سینیٹ','اسمبلی','عدالت','سپریم','کورٹ',
+    'فوج','پولیس','رینجرز','آئی ایس آئی','ایم آئی','سی ٹی ڈی',
+    'بی بی سی','جیو','اے آر وائی','ڈان','سماء','ایکسپریس','دنیا',
+    'آئی ایم ایف','ورلڈ','بینک','اقوام','متحدہ','یونیسف','ڈبلیو ایچ او',
+    'پی ٹی آئی','مسلم','لیگ','پیپلز','پارٹ','جمعیت','تحریک','لبیک',
+    'سٹیٹ','بینک','نیشنل','پی آئی اے','ریلوے','واپڈا','پیپکو',
+    'اوگرا','نیپرا','پیمرا','سیبک','نادرا','الیکشن','کمیشن',
+    'روئٹرز','اے پی','اے ایف پی','یو این','ناٹو','شنگھائ','سارک',
+}
+GAZETTEER_MISC = {
+    'کرونا','کووڈ','ڈیلٹا','اومیکرون','رمضان','عید','محرم','شب برات',
+    'آئین','قانون','بجٹ','پالیسی','منصوبہ','معاہدہ','معاہدات',
+    'رفال','ایف سولہ','ڈرون','میزائل','ایٹم','بم','جوہر','نیوکلیئر',
+}
+
+def ner_tag_sentence(tokens):
+    tags = ['O'] * len(tokens)
+    i = 0
+    while i < len(tokens):
+        tok = tokens[i]
+        # Check multi-word entities first
+        if i + 1 < len(tokens):
+            bigram = tok + ' ' + tokens[i+1]
+            if bigram in GAZETTEER_LOC:
+                tags[i] = 'B-LOC'; tags[i+1] = 'I-LOC'; i += 2; continue
+            if bigram in GAZETTEER_ORG:
+                tags[i] = 'B-ORG'; tags[i+1] = 'I-ORG'; i += 2; continue
+        # Single token
+        if tok in GAZETTEER_PER:
+            tags[i] = 'B-PER'
+        elif tok in GAZETTEER_LOC:
+            tags[i] = 'B-LOC'
+        elif tok in GAZETTEER_ORG:
+            tags[i] = 'B-ORG'
+        elif tok in GAZETTEER_MISC:
+            tags[i] = 'B-MISC'
+        else:
+            # heuristic: capitalised or ALL-CAPS sub-tokens
+            if len(tok) >= 3 and tok not in ('کے','کی','کا','نے','سے','کو','پر','میں','اور','یا'):
+                prev_tag = tags[i-1] if i > 0 else 'O'
+                if prev_tag.startswith('B-PER') or prev_tag.startswith('I-PER'):
+                    tags[i] = 'I-PER'
+        i += 1
+    return tags
+
+# Annotate all 500 sentences
+pos_annotations = [pos_tag(toks) for toks in sent_tokens]
+ner_annotations = [ner_tag_sentence(toks) for toks in sent_tokens]
+
+# Class distribution
+all_pos_tags = [t for tags in pos_annotations for t in tags]
+all_ner_tags = [t for tags in ner_annotations for t in tags]
+
+print("POS tag distribution:")
+for tag, cnt in sorted(Counter(all_pos_tags).items(), key=lambda x: -x[1]):
+    print(f"  {tag:8s}: {cnt:5d}")
+
+print("\nNER tag distribution (non-O):")
+ner_non_o = [t for t in all_ner_tags if t != 'O']
+for tag, cnt in sorted(Counter(ner_non_o).items(), key=lambda x: -x[1]):
+    print(f"  {tag:8s}: {cnt:5d}")
+print(f"  {'O':8s}: {all_ner_tags.count('O'):5d}")
+
+
+
+# ── 70/15/15 stratified split ──
+indices = list(range(len(sent_tokens)))
+from sklearn.model_selection import train_test_split
+
+idx_train, idx_temp = train_test_split(indices, test_size=0.30,
+                                        stratify=sent_topics, random_state=42)
+idx_val, idx_test   = train_test_split(idx_temp, test_size=0.50,
+                                        stratify=[sent_topics[i] for i in idx_temp],
+                                        random_state=42)
+
+def split_data(idx):
+    return ([sent_tokens[i]     for i in idx],
+            [pos_annotations[i] for i in idx],
+            [ner_annotations[i] for i in idx],
+            [sent_topics[i]     for i in idx])
+
+train_tok,train_pos,train_ner,train_top = split_data(idx_train)
+val_tok,  val_pos,  val_ner,  val_top   = split_data(idx_val)
+test_tok, test_pos, test_ner, test_top  = split_data(idx_test)
+
+print(f"Train: {len(train_tok)}  Val: {len(val_tok)}  Test: {len(test_tok)}")
+print(f"Train topics: {dict(Counter(train_top))}")
+print(f"Val   topics: {dict(Counter(val_top))}")
+print(f"Test  topics: {dict(Counter(test_top))}")
+
+# ── Write CoNLL files ──
+def write_conll(path, tokens_list, tags_list):
+    with open(path, 'w', encoding='utf-8') as f:
+        for tokens, tags in zip(tokens_list, tags_list):
+            for tok, tag in zip(tokens, tags):
+                f.write(f"{tok}\t{tag}\n")
+            f.write("\n")
+
+write_conll(f"{DATA_DIR}/pos_train.conll", train_tok, train_pos)
+write_conll(f"{DATA_DIR}/pos_test.conll",  test_tok,  test_pos)
+write_conll(f"{DATA_DIR}/ner_train.conll", train_tok, train_ner)
+write_conll(f"{DATA_DIR}/ner_test.conll",  test_tok,  test_ner)
+print("CoNLL files written.")
+
+
+
+# ── Label maps ──
+POS_TAGS = ['NOUN','VERB','ADJ','ADV','PRON','DET','CONJ','POST','NUM','PUNC','UNK']
+NER_TAGS = ['O','B-PER','I-PER','B-LOC','I-LOC','B-ORG','I-ORG','B-MISC','I-MISC']
+
+pos2idx = {t: i for i, t in enumerate(POS_TAGS)}
+idx2pos = {i: t for t, i in pos2idx.items()}
+ner2idx = {t: i for i, t in enumerate(NER_TAGS)}
+idx2ner = {i: t for t, i in ner2idx.items()}
+
+# ── Token vocabulary (from training set only) ──
+train_counter = Counter(tok for sent in train_tok for tok in sent)
+seq_vocab   = {'<PAD>': 0, '<UNK>': 1}
+for w, _ in train_counter.most_common(8000):
+    seq_vocab[w] = len(seq_vocab)
+seq_idx2w = {i: w for w, i in seq_vocab.items()}
+SEQ_V = len(seq_vocab)
+print(f"Sequence vocab: {SEQ_V}")
+
+# ── Use pretrained W2V embeddings to initialise ──
+pretrain_emb = np.zeros((SEQ_V, D_EMB), dtype=np.float32)
+hits = 0
+for w, i in seq_vocab.items():
+    if w in vocab:
+        pretrain_emb[i] = emb_c3[vocab[w]]
+        hits += 1
+print(f"W2V coverage: {hits}/{SEQ_V} ({100*hits/SEQ_V:.1f}%)")
+
+def encode_sent(tokens, vocab, max_len=None):
+    ids = [vocab.get(t, vocab['<UNK>']) for t in tokens]
+    if max_len:
+        ids = ids[:max_len]
+    return ids
+
+def encode_tags(tags, tag2idx):
+    return [tag2idx.get(t, 0) for t in tags]
+
+# ── Dataset ──
+class SeqDataset(Dataset):
+    def __init__(self, tokens_list, tags_list, tok_vocab, tag2idx):
+        self.data = []
+        for tokens, tags in zip(tokens_list, tags_list):
+            x = encode_sent(tokens, tok_vocab)
+            y = encode_tags(tags,   tag2idx)
+            self.data.append((x, y))
+
+    def __len__(self): return len(self.data)
+    def __getitem__(self, i): return self.data[i]
+
+def collate_fn(batch):
+    xs, ys   = zip(*batch)
+    lengths  = [len(x) for x in xs]
+    max_len  = max(lengths)
+    xs_pad   = torch.zeros(len(xs), max_len, dtype=torch.long)
+    ys_pad   = torch.full((len(ys), max_len), -1, dtype=torch.long)  # -1 = ignore
+    for i, (x, y) in enumerate(zip(xs, ys)):
+        xs_pad[i, :len(x)] = torch.tensor(x, dtype=torch.long)
+        ys_pad[i, :len(y)] = torch.tensor(y, dtype=torch.long)
+    return xs_pad, ys_pad, torch.tensor(lengths)
+
+ds_pos_train = SeqDataset(train_tok, train_pos, seq_vocab, pos2idx)
+ds_pos_val   = SeqDataset(val_tok,   val_pos,   seq_vocab, pos2idx)
+ds_pos_test  = SeqDataset(test_tok,  test_pos,  seq_vocab, pos2idx)
+ds_ner_train = SeqDataset(train_tok, train_ner, seq_vocab, ner2idx)
+ds_ner_val   = SeqDataset(val_tok,   val_ner,   seq_vocab, ner2idx)
+ds_ner_test  = SeqDataset(test_tok,  test_ner,  seq_vocab, ner2idx)
+
+BATCH_SEQ = 32
+kw = dict(batch_size=BATCH_SEQ, collate_fn=collate_fn)
+ld_pos_tr = DataLoader(ds_pos_train, shuffle=True,  **kw)
+ld_pos_vl = DataLoader(ds_pos_val,   shuffle=False, **kw)
+ld_pos_te = DataLoader(ds_pos_test,  shuffle=False, **kw)
+ld_ner_tr = DataLoader(ds_ner_train, shuffle=True,  **kw)
+ld_ner_vl = DataLoader(ds_ner_val,   shuffle=False, **kw)
+ld_ner_te = DataLoader(ds_ner_test,  shuffle=False, **kw)
+print("Dataloaders ready.")
+
+
+
+# ──────────────────────────────────────────────────────────────────
+# CRF LAYER with Viterbi decoding (from scratch)
+# ──────────────────────────────────────────────────────────────────
+class CRF(nn.Module):
+    def __init__(self, num_tags):
+        super().__init__()
+        self.num_tags   = num_tags
+        self.transitions = nn.Parameter(torch.randn(num_tags, num_tags) * 0.1)
+        # Penalise impossible start/end states
+        self.start_trans = nn.Parameter(torch.randn(num_tags) * 0.1)
+        self.end_trans   = nn.Parameter(torch.randn(num_tags) * 0.1)
+
+    def _log_likelihood(self, emissions, tags, mask):
+        # emissions: (B, T, C)   tags: (B, T)   mask: (B, T) bool
+        B, T, C = emissions.shape
+        score = torch.zeros(B, device=emissions.device)
+        score += self.start_trans[tags[:, 0]]
+        for t in range(T):
+            em_score  = emissions[:, t, :].gather(1, tags[:, t].unsqueeze(1)).squeeze(1)
+            score    += em_score * mask[:, t]
+            if t < T - 1:
+                trans_score = self.transitions[tags[:, t], tags[:, t+1]]
+                score      += trans_score * mask[:, t+1]
+        last_tag = tags.gather(1, mask.long().sum(1, keepdim=True) - 1).squeeze(1)
+        score   += self.end_trans[last_tag]
+        return score
+
+    def _log_partition(self, emissions, mask):
+        B, T, C = emissions.shape
+        alpha = self.start_trans.unsqueeze(0) + emissions[:, 0, :]
+        for t in range(1, T):
+            emit   = emissions[:, t, :].unsqueeze(1)
+            trans  = self.transitions.unsqueeze(0)
+            scores = alpha.unsqueeze(2) + emit + trans
+            alpha_new = torch.logsumexp(scores, dim=1)
+            alpha = torch.where(mask[:, t].unsqueeze(1), alpha_new, alpha)
+        alpha += self.end_trans.unsqueeze(0)
+        return torch.logsumexp(alpha, dim=1)
+
+    def forward(self, emissions, tags, mask):
+        ll   = self._log_likelihood(emissions, tags, mask)
+        logZ = self._log_partition(emissions, mask)
+        return (logZ - ll).mean()
+
+    def viterbi(self, emissions, mask):
+        B, T, C = emissions.shape
+        viterbi_score = self.start_trans.unsqueeze(0) + emissions[:, 0, :]
+        backpointers  = []
+        for t in range(1, T):
+            em    = emissions[:, t, :].unsqueeze(1)
+            tr    = self.transitions.unsqueeze(0)
+            score = viterbi_score.unsqueeze(2) + tr + em
+            best_score, best_tag = score.max(dim=1)
+            backpointers.append(best_tag)
+            viterbi_score = torch.where(mask[:, t].unsqueeze(1), best_score, viterbi_score)
+        viterbi_score += self.end_trans.unsqueeze(0)
+        best_last      = viterbi_score.argmax(dim=1)
+        best_paths     = [best_last.unsqueeze(1)]
+        for bp in reversed(backpointers):
+            best_last = bp.gather(1, best_last.unsqueeze(1)).squeeze(1)
+            best_paths.insert(0, best_last.unsqueeze(1))
+        return torch.cat(best_paths, dim=1)
+
+print("CRF class defined.")
+
+
+
+# ──────────────────────────────────────────────────────────────────
+# 2-LAYER BIDIRECTIONAL LSTM SEQUENCE LABELER
+# ──────────────────────────────────────────────────────────────────
+class BiLSTMTagger(nn.Module):
+    def __init__(self, vocab_size, embed_dim, hidden_dim, num_tags,
+                 pretrained_emb=None, freeze_emb=False,
+                 dropout=0.5, use_crf=False, num_layers=2, bidirectional=True):
+        super().__init__()
+        self.use_crf       = use_crf
+        self.bidirectional = bidirectional
+
+        # Embedding
+        self.embed = nn.Embedding(vocab_size, embed_dim, padding_idx=0)
+        if pretrained_emb is not None:
+            self.embed.weight = nn.Parameter(
+                torch.tensor(pretrained_emb, dtype=torch.float))
+        self.embed.weight.requires_grad = not freeze_emb
+
+        # LSTM
+        self.lstm = nn.LSTM(
+            embed_dim, hidden_dim,
+            num_layers=num_layers,
+            batch_first=True,
+            bidirectional=bidirectional,
+            dropout=dropout if num_layers > 1 else 0.0
+        )
+        self.dropout = nn.Dropout(dropout)
+
+        lstm_out_dim = hidden_dim * (2 if bidirectional else 1)
+        self.fc      = nn.Linear(lstm_out_dim, num_tags)
+
+        self.crf = CRF(num_tags) if use_crf else None
+
+    def forward(self, x, lengths, tags=None):
+        emb  = self.dropout(self.embed(x))          # (B, T, E)
+        packed = nn.utils.rnn.pack_padded_sequence(
+            emb, lengths.cpu(), batch_first=True, enforce_sorted=False)
+        out, _ = self.lstm(packed)
+        out, _ = nn.utils.rnn.pad_packed_sequence(out, batch_first=True)
+        out    = self.dropout(out)
+        emissions = self.fc(out)                     # (B, T, C)
+
+        if self.use_crf and tags is not None:
+            mask = (x != 0)
+            loss = self.crf(emissions, tags, mask)
+            return loss
+        elif self.use_crf:
+            mask = (x != 0)
+            return self.crf.viterbi(emissions, mask)
+        else:
+            return emissions
+
+print("BiLSTMTagger class defined.")
+
+
+
+def train_bilstm(model, train_loader, val_loader, idx2tag, task="pos",
+                 epochs=20, patience=5, label=""):
+    opt = optim.Adam(model.parameters(), lr=1e-3, weight_decay=1e-4)
+    criterion = nn.CrossEntropyLoss(ignore_index=-1)
+    best_f1, wait = 0.0, 0
+    train_losses, val_losses = [], []
+
+    for epoch in range(1, epochs + 1):
+        # ── Train ──
+        model.train(); ep_loss = 0.; steps = 0
+        for x, y, lengths in train_loader:
+            x, y, lengths = x.to(DEVICE), y.to(DEVICE), lengths.to(DEVICE)
+            opt.zero_grad()
+            if model.use_crf:
+                mask = (x != 0)
+                valid_y = y.clone(); valid_y[y == -1] = 0
+                loss = model(x, lengths, valid_y)
+            else:
+                logits = model(x, lengths)
+                B, T, C = logits.shape
+                loss = criterion(logits.view(B*T, C), y.view(B*T))
+            loss.backward(); opt.step()
+            ep_loss += loss.item(); steps += 1
+
+        avg_tr = ep_loss / max(steps, 1)
+        train_losses.append(avg_tr)
+
+        # ── Validate ──
+        model.eval(); vl_loss = 0.; vsteps = 0
+        all_preds, all_gold = [], []
+        with torch.no_grad():
+            for x, y, lengths in val_loader:
+                x, y, lengths = x.to(DEVICE), y.to(DEVICE), lengths.to(DEVICE)
+                if model.use_crf:
+                    mask    = (x != 0)
+                    valid_y = y.clone(); valid_y[y == -1] = 0
+                    vl_loss += model(x, lengths, valid_y).item(); vsteps += 1
+                    preds   = model(x, lengths)
+                else:
+                    logits  = model(x, lengths)
+                    B, T, C = logits.shape
+                    vl_loss += criterion(logits.view(B*T, C), y.view(B*T)).item(); vsteps += 1
+                    preds   = logits.argmax(dim=-1)
+
+                # Collect predictions (non-padded)
+                mask_cpu = (y != -1).cpu().numpy()
+                for b in range(x.size(0)):
+                    L = int(lengths[b])
+                    all_preds.extend(preds[b, :L].cpu().numpy().tolist())
+                    all_gold.extend(y[b, :L].cpu().numpy().tolist())
+
+        avg_vl = vl_loss / max(vsteps, 1)
+        val_losses.append(avg_vl)
+        f1 = f1_score(all_gold, all_preds, average='macro',
+                      labels=list(range(len(idx2tag))), zero_division=0)
+
+        print(f"  [{label}] Epoch {epoch:2d}/{epochs}  "
+              f"train_loss={avg_tr:.4f}  val_loss={avg_vl:.4f}  val_F1={f1:.4f}")
+
+        if f1 > best_f1:
+            best_f1 = f1; wait = 0
+            torch.save(model.state_dict(), f"{MODEL_DIR}/best_{label}.pt")
+        else:
+            wait += 1
+            if wait >= patience:
+                print(f"  Early stopping at epoch {epoch}")
+                break
+
+    # Restore best
+    model.load_state_dict(torch.load(f"{MODEL_DIR}/best_{label}.pt", map_location=DEVICE))
+    return train_losses, val_losses, best_f1
+
+print("train_bilstm() defined.")
+
+
+
+
+
+HIDDEN_DIM = 128
+
+# ── POS: frozen embeddings ──
+print("Training POS (frozen embeddings)...")
+model_pos_frozen = BiLSTMTagger(
+    SEQ_V, D_EMB, HIDDEN_DIM, len(POS_TAGS),
+    pretrained_emb=pretrain_emb, freeze_emb=True,
+    dropout=0.5, use_crf=False
+).to(DEVICE)
+
+tr_loss_pf, vl_loss_pf, f1_pf = train_bilstm(
+    model_pos_frozen, ld_pos_tr, ld_pos_vl, idx2pos,
+    task="pos", epochs=20, patience=5, label="pos_frozen")
+
+# ── POS: fine-tuned embeddings ──
+print("\nTraining POS (fine-tuned embeddings)...")
+model_pos_ft = BiLSTMTagger(
+    SEQ_V, D_EMB, HIDDEN_DIM, len(POS_TAGS),
+    pretrained_emb=pretrain_emb, freeze_emb=False,
+    dropout=0.5, use_crf=False
+).to(DEVICE)
+
+tr_loss_pft, vl_loss_pft, f1_pft = train_bilstm(
+    model_pos_ft, ld_pos_tr, ld_pos_vl, idx2pos,
+    task="pos", epochs=20, patience=5, label="pos_ft")
+
+torch.save(model_pos_ft.state_dict(), f"{MODEL_DIR}/bilstm_pos.pt")
+
+# Plot POS training curves
+fig, axes = plt.subplots(1, 2, figsize=(14, 4))
+for ax, (tl, vl, lbl) in zip(axes, [
+        (tr_loss_pf,  vl_loss_pf,  "Frozen"),
+        (tr_loss_pft, vl_loss_pft, "Fine-tuned")]):
+    ep = range(1, len(tl)+1)
+    ax.plot(ep, tl, label='Train', color='steelblue')
+    ax.plot(ep, vl, label='Val',   color='coral')
+    ax.set_title(f"POS Loss — {lbl} Embeddings", fontweight='bold')
+    ax.set_xlabel("Epoch"); ax.set_ylabel("Loss"); ax.legend(); ax.grid(alpha=0.3)
+plt.tight_layout()
+plt.savefig(f"{FIG_DIR}/pos_training_curves.png", dpi=150)
+plt.show()
+print(f"\nBest Val F1 — Frozen: {f1_pf:.4f}  Fine-tuned: {f1_pft:.4f}")
+
+
+
+
+# ── NER: with CRF (fine-tuned) ──
+print("Training NER (CRF + fine-tuned)...")
+model_ner_crf = BiLSTMTagger(
+    SEQ_V, D_EMB, HIDDEN_DIM, len(NER_TAGS),
+    pretrained_emb=pretrain_emb, freeze_emb=False,
+    dropout=0.5, use_crf=True
+).to(DEVICE)
+
+tr_ner_crf, vl_ner_crf, f1_ner_crf = train_bilstm(
+    model_ner_crf, ld_ner_tr, ld_ner_vl, idx2ner,
+    task="ner", epochs=20, patience=5, label="ner_crf")
+
+# ── NER: without CRF (softmax) ──
+print("\nTraining NER (softmax, no CRF)...")
+model_ner_nocrf = BiLSTMTagger(
+    SEQ_V, D_EMB, HIDDEN_DIM, len(NER_TAGS),
+    pretrained_emb=pretrain_emb, freeze_emb=False,
+    dropout=0.5, use_crf=False
+).to(DEVICE)
+
+tr_ner_nc, vl_ner_nc, f1_ner_nc = train_bilstm(
+    model_ner_nocrf, ld_ner_tr, ld_ner_vl, idx2ner,
+    task="ner", epochs=20, patience=5, label="ner_nocrf")
+
+torch.save(model_ner_crf.state_dict(), f"{MODEL_DIR}/bilstm_ner.pt")
+
+fig, axes = plt.subplots(1, 2, figsize=(14, 4))
+for ax, (tl, vl, lbl) in zip(axes, [
+        (tr_ner_crf, vl_ner_crf, "NER + CRF"),
+        (tr_ner_nc,  vl_ner_nc,  "NER (Softmax)")]):
+    ep = range(1, len(tl)+1)
+    ax.plot(ep, tl, label='Train', color='steelblue')
+    ax.plot(ep, vl, label='Val',   color='coral')
+    ax.set_title(f"{lbl} Training Loss", fontweight='bold')
+    ax.set_xlabel("Epoch"); ax.set_ylabel("Loss"); ax.legend(); ax.grid(alpha=0.3)
+plt.tight_layout()
+plt.savefig(f"{FIG_DIR}/ner_training_curves.png", dpi=150)
+plt.show()
+print(f"\nBest Val F1 — NER+CRF: {f1_ner_crf:.4f}  NER-softmax: {f1_ner_nc:.4f}")
+
+
+
