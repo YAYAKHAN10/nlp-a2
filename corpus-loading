@@ -1,0 +1,38 @@
+def load_corpus(path, encoding='utf-8', errors=None):
+    """Returns list of article strings."""
+    with open(path, encoding=encoding, errors=errors) as f:
+        raw = f.read()
+    docs = []
+    for block in raw.split('ARTICLE_'):
+        block = block.strip()
+        if not block:
+            continue
+        lines = block.split('\n')
+        text_lines = [l.strip() for l in lines[1:] if l.strip()]
+        if text_lines:
+            docs.append(' '.join(text_lines))
+    return docs
+
+def load_all_tokens(path, encoding='utf-8', errors=None):
+    with open(path, encoding=encoding, errors=errors) as f:
+        raw = f.read()
+    tokens = []
+    for line in raw.split('\n'):
+        line = line.strip()
+        if line and not line.startswith('ARTICLE_'):
+            tokens.extend(line.split())
+    return tokens
+
+docs_clean = load_corpus(f"{BASE}/cleaned.txt")
+docs_raw   = load_corpus(f"{BASE}/raw.txt", errors='ignore')
+tokens_clean = load_all_tokens(f"{BASE}/cleaned.txt")
+tokens_raw   = load_all_tokens(f"{BASE}/raw.txt", errors='ignore')
+
+with open(f"{BASE}/Metadata.json", encoding='utf-8') as f:
+    metadata = json.load(f)
+
+print(f"Articles (clean): {len(docs_clean)}")
+print(f"Articles (raw):   {len(docs_raw)}")
+print(f"Tokens  (clean):  {len(tokens_clean)}")
+print(f"Tokens  (raw):    {len(tokens_raw)}")
+print(f"Metadata entries: {len(metadata)}")
