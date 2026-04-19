@@ -1,0 +1,196 @@
+def load_corpus(path, encoding='utf-8', errors=None):
+    """Returns list of article strings."""
+    with open(path, encoding=encoding, errors=errors) as f:
+        raw = f.read()
+    docs = []
+    for block in raw.split('ARTICLE_'):
+        block = block.strip()
+        if not block:
+            continue
+        lines = block.split('\n')
+        text_lines = [l.strip() for l in lines[1:] if l.strip()]
+        if text_lines:
+            docs.append(' '.join(text_lines))
+    return docs
+
+def load_all_tokens(path, encoding='utf-8', errors=None):
+    with open(path, encoding=encoding, errors=errors) as f:
+        raw = f.read()
+    tokens = []
+    for line in raw.split('\n'):
+        line = line.strip()
+        if line and not line.startswith('ARTICLE_'):
+            tokens.extend(line.split())
+    return tokens
+
+docs_clean = load_corpus(f"{BASE}/cleaned.txt")
+docs_raw   = load_corpus(f"{BASE}/raw.txt", errors='ignore')
+tokens_clean = load_all_tokens(f"{BASE}/cleaned.txt")
+tokens_raw   = load_all_tokens(f"{BASE}/raw.txt", errors='ignore')
+
+with open(f"{BASE}/Metadata.json", encoding='utf-8') as f:
+    metadata = json.load(f)
+
+print(f"Articles (clean): {len(docs_clean)}")
+print(f"Articles (raw):   {len(docs_raw)}")
+print(f"Tokens  (clean):  {len(tokens_clean)}")
+print(f"Tokens  (raw):    {len(tokens_raw)}")
+print(f"Metadata entries: {len(metadata)}")
+
+
+
+
+
+
+
+# Topic assignment using keyword matching on article text
+TOPIC_KW = {
+    'Politics':         ['حکومت','وزیر','پارلیمنٹ','الیکشن','سیاست','جمہوریت','عمران','شریف','بھٹو','پارٹ'],
+    'Sports':           ['کرکٹ','میچ','ٹیم','کھلاڑ','اسکور','کپ','بلے','رنز','وکٹ','ٹورنامنٹ'],
+    'Economy':          ['بجٹ','اقتصاد','مہنگائ','بینک','تجارت','روپ','برآمد','درآمد','جی ڈی پی','افراط'],
+    'International':    ['اقوام','معاہدہ','بیرون','دوطرف','تنازع','امریک','چین','روس','افغ','ایران'],
+    'Health & Society': ['ہسپتال','بیمار','ویکسین','سیلاب','تعلیم','کرون','وبا','صحت','یونیورسٹ','مدرس'],
+}
+color_map = {
+    'Politics':'#e74c3c','Sports':'#2ecc71','Economy':'#3498db',
+    'International':'#9b59b6','Health & Society':'#f39c12'
+}
+
+def assign_topic(text):
+    scores = {cat: 0 for cat in TOPIC_KW}
+    for cat, kws in TOPIC_KW.items():
+        for kw in kws:
+            if kw in text:
+                scores[cat] += 1
+    best = max(scores, key=scores.get)
+    return best if scores[best] > 0 else 'Politics'
+
+doc_topics = [assign_topic(d) for d in docs_clean]
+topic_dist = Counter(doc_topics)
+print("Topic distribution:", dict(topic_dist))
+
+# Top-10 discriminative words per topic
+print("\nTop-10 TF-IDF discriminative words per topic:")
+for topic in TOPIC_KW:
+    idxs = [j for j, t in enumerate(doc_topics) if t == topic]
+    if not idxs:
+        continue
+    mean_tfidf = tfidf_matrix[:, idxs].mean(axis=1)
+    top10      = np.argsort(mean_tfidf)[::-1][:10]
+    words      = [idx2word[i] for i in top10 if idx2word[i] != '<UNK>'][:10]
+    print(f"  {topic:22s}: {', '.join(words)}")
+
+
+
+
+
+WINDOW_K  = 5
+PPMI_SIZE = 2000   # top-2000 words for PPMI matrix
+
+common_words = [w for w, _ in global_counter.most_common(PPMI_SIZE)]
+ppmi_vocab   = {w: i for i, w in enumerate(common_words)}
+ppmi_idx2w   = {i: w for w, i in ppmi_vocab.items()}
+
+# Word counts for probability estimates
+word_cnt     = Counter(tokens_clean)
+total_tokens = sum(word_cnt.values())
+
+# Co-occurrence counts (vectorised over offsets)
+tids_clean = np.array([vocab.get(t, vocab['<UNK>']) for t in tokens_clean], dtype=np.int32)
+ppmi_ids   = np.array([ppmi_vocab.get(t, -1)        for t in tokens_clean], dtype=np.int32)
+
+cooc_counts = np.zeros((PPMI_SIZE, PPMI_SIZE), dtype=np.float32)
+total_pairs = 0
+
+for offset in range(-WINDOW_K, WINDOW_K + 1):
+    if offset == 0:
+        continue
+    i_pos = np.arange(len(ppmi_ids))
+    j_pos = i_pos + offset
+    mask  = (j_pos >= 0) & (j_pos < len(ppmi_ids))
+    ip, jp = ppmi_ids[i_pos[mask]], ppmi_ids[j_pos[mask]]
+    valid  = (ip >= 0) & (jp >= 0)
+    ip, jp = ip[valid], jp[valid]
+    np.add.at(cooc_counts, (ip, jp), 1)
+    total_pairs += len(ip)
+
+print(f"Total co-occurrence pairs: {total_pairs}")
+
+# P(w1, w2), P(w1), P(w2)
+p_joint = cooc_counts / (total_pairs + 1e-10)
+p_w     = np.array([word_cnt.get(w, 0) / total_tokens for w in common_words], dtype=np.float32)
+
+# PPMI(w1,w2) = max(0, log2(P(w1,w2) / P(w1)*P(w2)))
+outer   = np.outer(p_w, p_w) + 1e-10
+ppmi_matrix = np.maximum(0.0, np.log2(p_joint / outer + 1e-10))
+np.fill_diagonal(ppmi_matrix, 0)
+
+np.save(f"{EMBED_DIR}/ppmi_matrix.npy", ppmi_matrix)
+print(f"PPMI matrix saved  shape={ppmi_matrix.shape}")
+
+# ── Top-5 nearest neighbours (cosine) for 10 query words ──
+def ppmi_neighbors(word, n=5):
+    if word not in ppmi_vocab:
+        return []
+    qi  = ppmi_vocab[word]
+    vec = ppmi_matrix[qi]
+    norms = np.linalg.norm(ppmi_matrix, axis=1) + 1e-10
+    sims  = ppmi_matrix @ vec / (norms * (np.linalg.norm(vec) + 1e-10))
+    sims[qi] = -1
+    top = np.argsort(sims)[::-1][:n]
+    return [(ppmi_idx2w[i], float(sims[i])) for i in top]
+
+PPMI_QUERIES = ['پاکست','کرکٹ','حکومت','بجٹ','عدالت','فوج','تعلیم','صحت','عوام','وزیر']
+print("\nPPMI Top-5 Nearest Neighbours:")
+for qw in PPMI_QUERIES:
+    nn = ppmi_neighbors(qw)
+    print(f"  {qw:15s}: {[w for w,_ in nn]}")
+
+
+
+# ── t-SNE Visualisation ──
+TOP_VIZ = 200
+viz_vecs = ppmi_matrix[:TOP_VIZ]
+
+TOPIC_SEEDS = {
+    'Politics':         ['حکومت','وزیر','پارلیمنٹ','سیاست','خان'],
+    'Sports':           ['کرکٹ','کھیل','ٹیم','میچ','بلے'],
+    'Economy':          ['بجٹ','روپ','بینک','تجارت'],
+    'International':    ['اقوام','معاہدہ','افغ','طالب'],
+    'Health & Society': ['ہسپتال','تعلیم','سیلاب','بیمار'],
+}
+
+def get_category(word):
+    for cat, seeds in TOPIC_SEEDS.items():
+        for s in seeds:
+            if s in word:
+                return cat
+    return 'Other'
+
+cats   = [get_category(common_words[i]) for i in range(TOP_VIZ)]
+cmap2  = {**color_map, 'Other': '#95a5a6'}
+colors = [cmap2[c] for c in cats]
+
+tsne   = TSNE(n_components=2, random_state=42, perplexity=30, max_iter=1000)
+vecs2d = tsne.fit_transform(viz_vecs)
+
+fig, ax = plt.subplots(figsize=(14, 10))
+for cat, col in cmap2.items():
+    mask = [i for i, c in enumerate(cats) if c == cat]
+    if mask:
+        ax.scatter(vecs2d[mask, 0], vecs2d[mask, 1], c=col, label=cat, alpha=0.75, s=45)
+
+for i in range(min(80, TOP_VIZ)):
+    ax.annotate(common_words[i], (vecs2d[i, 0], vecs2d[i, 1]), fontsize=5.5, alpha=0.85)
+
+ax.set_title("t-SNE of 200 Most Frequent Tokens (PPMI Vectors)", fontsize=14, fontweight='bold')
+ax.set_xlabel("Dimension 1"); ax.set_ylabel("Dimension 2")
+ax.legend(loc='best', fontsize=9)
+plt.tight_layout()
+plt.savefig(f"{FIG_DIR}/tsne_ppmi.png", dpi=150)
+plt.show()
+print("t-SNE plot saved.")
+
+
+
+
